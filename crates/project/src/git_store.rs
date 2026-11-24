@@ -31,7 +31,7 @@ use futures::{
         oneshot::{self, Canceled},
     },
     future::{self, BoxFuture, Shared},
-    stream::{FuturesOrdered, FuturesUnordered},
+    stream::{self, FuturesOrdered, FuturesUnordered},
 };
 use git::{
     BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
@@ -74,6 +74,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
+    ffi::OsStr,
     future::Future,
     mem,
     ops::Range,
@@ -9443,6 +9444,17 @@ impl Repository {
             .then_some(&self.work_directory_abs_path)
     }
 
+    pub fn git_binary_path(&mut self) -> oneshot::Receiver<Option<PathBuf>> {
+        self.send_job("git binary path", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.git_binary_path()
+                }
+                RepositoryState::Remote(_) => None,
+            }
+        })
+    }
+
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
         let id = self.id;
         self.send_job("worktrees", None, move |repo, _| async move {
@@ -11108,6 +11120,230 @@ pub async fn discover_root_repository_group_path(
         )
         .to_path_buf(),
     )
+}
+
+pub struct DeltaCheckout {
+    pub clone: DeltaClone,
+    pub repository_dir: Arc<Path>,
+    pub is_delta_clone: bool,
+}
+
+pub async fn discover_delta_checkouts(
+    source_common_dir: &Path,
+    listed_common_dir: Option<&Path>,
+    fs: &dyn Fs,
+) -> Vec<DeltaCheckout> {
+    let Ok(source_common_dir) = fs.canonicalize(source_common_dir).await else {
+        return Vec::new();
+    };
+    let listed_common_dir = match listed_common_dir {
+        Some(listed_common_dir) => Some(
+            fs.canonicalize(listed_common_dir)
+                .await
+                .unwrap_or_else(|_| listed_common_dir.to_path_buf()),
+        ),
+        None => None,
+    };
+    let source_common_dir = source_common_dir.as_path();
+    let repository_path = repo_identity_path(source_common_dir, PathStyle::local());
+    let is_dot_git = source_common_dir.file_name() == Some(OsStr::new(".git"));
+    let store_root = if is_dot_git {
+        source_common_dir.parent().unwrap_or(source_common_dir)
+    } else {
+        source_common_dir
+    };
+    let mut store_paths = vec![store_root.join(".delta").join("worktrees")];
+    let is_managed_repositories =
+        |path: &Path| path.file_name() == Some(OsStr::new("managed-repositories"));
+    let managed_root = if is_dot_git {
+        None
+    } else if source_common_dir
+        .parent()
+        .is_some_and(is_managed_repositories)
+    {
+        Some(source_common_dir)
+    } else {
+        source_common_dir
+            .parent()
+            .filter(|parent| parent.parent().is_some_and(is_managed_repositories))
+    };
+    if let Some(managed_root) = managed_root
+        && let Some(store_directory) = managed_root.parent().and_then(Path::parent)
+    {
+        store_paths.push(managed_root.join("worktrees"));
+        store_paths.push(store_directory.join("worktrees"));
+        if let Some(base_directory) = store_directory.parent() {
+            store_paths.push(base_directory.join("worktrees"));
+        }
+    }
+    let checkout_paths = read_store_entries(&store_paths, fs).await;
+    let mut delta_checkouts = verified_delta_checkouts(checkout_paths, &repository_path, fs).await;
+    let mut registry_paths = delta_checkouts
+        .iter()
+        .map(|checkout| checkout.clone.path.as_path())
+        .chain([source_common_dir])
+        .filter(|registry_path| listed_common_dir.as_deref() != Some(*registry_path))
+        .collect::<Vec<_>>();
+    registry_paths.sort();
+    registry_paths.dedup();
+    let registered_paths = read_registered_worktrees(&registry_paths, fs).await;
+    delta_checkouts.retain(is_in_its_clone_slot);
+    delta_checkouts.extend(verified_delta_checkouts(registered_paths, &repository_path, fs).await);
+    delta_checkouts.retain(|checkout| {
+        !checkout.clone.is_linked_worktree
+            || listed_common_dir.as_deref() != Some(checkout.clone.path.as_path())
+    });
+    delta_checkouts.sort_by(|a, b| a.clone.checkout_path.cmp(&b.clone.checkout_path));
+    delta_checkouts.dedup_by(|a, b| a.clone.checkout_path == b.clone.checkout_path);
+    delta_checkouts
+}
+
+const MAX_CONCURRENT_STORE_PROBES: usize = 16;
+
+async fn read_store_entries(store_paths: &[PathBuf], fs: &dyn Fs) -> Vec<PathBuf> {
+    let namespace_paths = future::join_all(store_paths.iter().map(|store_path| async move {
+        let is_redirected = fs
+            .canonicalize(store_path)
+            .await
+            .is_ok_and(|canonical_path| canonical_path != *store_path);
+        read_directory_paths(store_path, is_redirected, fs).await
+    }))
+    .await;
+    stream::iter(namespace_paths.into_iter().flatten())
+        .map(|namespace_path| async move { read_directory_paths(&namespace_path, false, fs).await })
+        .buffer_unordered(MAX_CONCURRENT_STORE_PROBES)
+        .flat_map(stream::iter)
+        .collect()
+        .await
+}
+
+fn is_in_its_clone_slot(checkout: &DeltaCheckout) -> bool {
+    let Some(checkout_path) = checkout.clone.checkout_path.as_deref() else {
+        return false;
+    };
+    let (Some(name), Some(namespace)) = (
+        checkout_path.file_name(),
+        checkout_path.parent().and_then(Path::file_name),
+    ) else {
+        return false;
+    };
+    let mut clone_name = name.to_os_string();
+    clone_name.push(".git");
+    checkout.clone.path.file_name() == Some(clone_name.as_os_str())
+        && checkout.clone.path.parent().and_then(Path::file_name) == Some(namespace)
+}
+
+async fn read_registered_worktrees(registry_paths: &[&Path], fs: &dyn Fs) -> Vec<PathBuf> {
+    let entry_paths = future::join_all(registry_paths.iter().map(|registry_path| async move {
+        read_directory_paths(&registry_path.join("worktrees"), false, fs).await
+    }))
+    .await;
+    future::join_all(
+        entry_paths
+            .into_iter()
+            .flatten()
+            .map(|entry_path| async move {
+                let gitdir_path = entry_path.join("gitdir");
+                if !fs.is_file(&gitdir_path).await {
+                    return None;
+                }
+                let gitdir = fs.load(&gitdir_path).await.ok()?;
+                let dot_git_path = entry_path.join(gitdir.trim_end());
+                Some(match dot_git_path.file_name() {
+                    Some(name) if name == OsStr::new(".git") => {
+                        dot_git_path.parent()?.to_path_buf()
+                    }
+                    _ => dot_git_path,
+                })
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn verified_delta_checkouts(
+    checkout_paths: Vec<PathBuf>,
+    repository_path: &Path,
+    fs: &dyn Fs,
+) -> Vec<DeltaCheckout> {
+    stream::iter(checkout_paths)
+        .map(|checkout_path| async move {
+            let checkout_path = fs.canonicalize(&checkout_path).await.ok()?;
+            let metadata =
+                worktree::discover_confirmed_root_repo_metadata(&checkout_path, fs).await?;
+            if metadata.source_common_dir.is_none() && !metadata.is_linked_worktree {
+                return None;
+            }
+            let group_path = root_repository_group_path(
+                &checkout_path,
+                &metadata.common_dir,
+                metadata.is_linked_worktree,
+                metadata.source_common_dir.as_deref(),
+                PathStyle::local(),
+            );
+            if group_path != repository_path {
+                return None;
+            }
+            Some(DeltaCheckout {
+                clone: DeltaClone {
+                    path: metadata.common_dir.to_path_buf(),
+                    is_linked_worktree: metadata.is_linked_worktree,
+                    checkout_path: Some(checkout_path),
+                },
+                repository_dir: metadata.repository_dir,
+                is_delta_clone: metadata.source_common_dir.is_some(),
+            })
+        })
+        .buffer_unordered(MAX_CONCURRENT_STORE_PROBES)
+        .filter_map(future::ready)
+        .collect()
+        .await
+}
+
+async fn read_directory_paths(
+    directory_path: &Path,
+    delta_names_only: bool,
+    fs: &dyn Fs,
+) -> Vec<PathBuf> {
+    if !fs.is_dir(directory_path).await {
+        return Vec::new();
+    }
+    let entries = match fs.read_dir(directory_path).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::debug!("reading Delta checkouts in {directory_path:?}: {error:#}");
+            return Vec::new();
+        }
+    };
+    let entries = entries
+        .filter_map(|entry| {
+            future::ready(entry.ok().filter(|entry| {
+                !delta_names_only || entry.file_name().is_some_and(is_delta_directory_name)
+            }))
+        })
+        .collect::<Vec<_>>()
+        .await;
+    stream::iter(entries)
+        .map(|entry| async move { is_plain_directory(&entry, fs).await.then_some(entry) })
+        .buffer_unordered(MAX_CONCURRENT_STORE_PROBES)
+        .filter_map(future::ready)
+        .collect()
+        .await
+}
+
+async fn is_plain_directory(path: &Path, fs: &dyn Fs) -> bool {
+    fs.read_link(path).await.is_err() && fs.is_dir(path).await
+}
+
+fn is_delta_directory_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.len() == 12
+            && name
+                .bytes()
+                .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&byte))
+    })
 }
 
 pub(crate) fn root_repository_group_path<'a>(

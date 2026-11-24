@@ -1122,6 +1122,10 @@ pub trait GitRepository: Send + Sync {
 
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
+
+    fn git_binary_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 pub enum DiffType {
@@ -3515,6 +3519,10 @@ impl GitRepository for RealGitRepository {
     fn is_trusted(&self) -> bool {
         self.is_trusted.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    fn git_binary_path(&self) -> Option<PathBuf> {
+        Some(self.any_git_binary_path.clone())
+    }
 }
 
 async fn run_commit_data_reader(
@@ -3690,6 +3698,22 @@ fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
         }
     }));
     args
+}
+
+pub fn untrusted_git_command<S: AsRef<OsStr>>(
+    git_binary_path: &Path,
+    working_directory: &Path,
+    executor: BackgroundExecutor,
+    args: &[S],
+) -> util::command::Command {
+    GitBinary::new(
+        git_binary_path.to_path_buf(),
+        working_directory.to_path_buf(),
+        working_directory.to_path_buf(),
+        executor,
+        false,
+    )
+    .build_command(args)
 }
 
 pub(crate) struct GitBinary {
